@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "celp-codec"
+version = "0.1.0"
+description = "Quality-focused CELP/ACELP speech codec (WAV -> bitstream + recon WAV)"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.20", "scipy>=1.8", "soundfile>=0.12"]
+
+[project.scripts]
+celpcodec = "celp_codec.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["celp_codec*"]
