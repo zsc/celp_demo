@@ -1192,7 +1192,7 @@ def _render(
 
     <section class="method" id="summary">
       <h2>方法横向对比（按 bitstream header 分组）</h2>
-      <p class="method-meta">表中 “payload/frame” 与 “payload kbps” 由 header 推导，代表最小必要 payload 比特预算（不含文件尾部 padding）。若目录存在参考 WAV（默认 <code>*_prompt.wav</code>，或用 <code>--ref</code> 指定），会自动计算 SNR/segSNR，并按综合评分选出“综合最优”。</p>
+      <p class="method-meta">表中 “payload/frame” 与 “payload kbps” 由 header 推导，代表最小必要 payload 比特预算（不含文件尾部 padding）。若目录存在参考 WAV（默认 <code>*_prompt.wav</code>，或用 <code>--ref</code> 指定），会自动计算 <code>SNR/segSNR/melSNR</code>（melSNR=log-mel 能量域 SNR），并按综合评分选出“综合最优”。</p>
       <table class="summary">
         <thead>
           <tr>
