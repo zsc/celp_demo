@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import html
 import os
 import statistics
+import struct
 import sys
+import zlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
+
+import numpy as np
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -622,6 +627,120 @@ def _safe_max(vals: list[float]) -> float | None:
     return float(max(vals))
 
 
+def _png_chunk(tag: bytes, data: bytes) -> bytes:
+    if len(tag) != 4:
+        raise ValueError("PNG chunk tag must be 4 bytes")
+    crc = zlib.crc32(tag)
+    crc = zlib.crc32(data, crc)
+    crc &= 0xFFFFFFFF
+    return len(data).to_bytes(4, "big") + tag + data + crc.to_bytes(4, "big")
+
+
+def _png_encode_rgb8(rgb: np.ndarray) -> bytes:
+    rgb = np.asarray(rgb)
+    if rgb.ndim != 3 or rgb.shape[2] != 3:
+        raise ValueError("rgb must have shape (H, W, 3)")
+    if rgb.dtype != np.uint8:
+        rgb = rgb.astype(np.uint8)
+
+    h = int(rgb.shape[0])
+    w = int(rgb.shape[1])
+    if h <= 0 or w <= 0:
+        raise ValueError("invalid image size")
+
+    # Filter type 0 per row.
+    raw = b"".join(b"\x00" + rgb[i].tobytes() for i in range(h))
+    comp = zlib.compress(raw, level=6)
+
+    sig = b"\x89PNG\r\n\x1a\n"
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)  # 8-bit, truecolor
+    return sig + _png_chunk(b"IHDR", ihdr) + _png_chunk(b"IDAT", comp) + _png_chunk(b"IEND", b"")
+
+
+def _mel_spectrogram_db(
+    x: np.ndarray,
+    fs: int,
+    n_mels: int = 64,
+    win_ms: float = 25.0,
+    hop_ms: float = 10.0,
+    fmin: float = 50.0,
+    fmax: float | None = None,
+    eps: float = 1e-12,
+) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64).ravel()
+    fs = int(fs)
+    if fs <= 0:
+        raise ValueError("fs must be > 0")
+
+    win_length = int(round(float(fs) * (float(win_ms) / 1000.0)))
+    hop_length = int(round(float(fs) * (float(hop_ms) / 1000.0)))
+    win_length = int(max(16, win_length))
+    hop_length = int(max(1, hop_length))
+
+    n_fft = 1
+    while n_fft < win_length:
+        n_fft <<= 1
+    n_fft = int(max(256, n_fft))
+
+    power = metrics._stft_power(x, n_fft=n_fft, win_length=win_length, hop_length=hop_length)
+    fb = metrics.mel_filterbank(fs=fs, n_fft=n_fft, n_mels=int(n_mels), fmin=float(fmin), fmax=fmax)
+    mel = power @ fb.T  # (n_frames, n_mels)
+    mel_db = 10.0 * np.log10(mel + float(eps))
+    return mel_db
+
+
+def _resample_time(m: np.ndarray, width: int) -> np.ndarray:
+    m = np.asarray(m, dtype=np.float64)
+    width = int(width)
+    if width <= 0:
+        raise ValueError("width must be > 0")
+    if m.ndim != 2:
+        raise ValueError("m must be 2D (n_frames, n_mels)")
+    n_frames, n_mels = int(m.shape[0]), int(m.shape[1])
+    if n_frames <= 0:
+        raise ValueError("m must have >=1 frame")
+    if n_frames == width:
+        return m
+    if n_frames == 1:
+        return np.repeat(m, width, axis=0)
+    t0 = np.linspace(0.0, 1.0, n_frames, dtype=np.float64)
+    t1 = np.linspace(0.0, 1.0, width, dtype=np.float64)
+    out = np.empty((width, n_mels), dtype=np.float64)
+    for i in range(n_mels):
+        out[:, i] = np.interp(t1, t0, m[:, i])
+    return out
+
+
+def _mel_png_data_uri(
+    wav_path: Path,
+    width: int = 560,
+    n_mels: int = 64,
+) -> str | None:
+    try:
+        x, fs = wav_io.read_wav(wav_path)
+        mel_db = _mel_spectrogram_db(x, fs=fs, n_mels=int(n_mels))
+        mel_db = _resample_time(mel_db, width=int(width))
+
+        # Convert to image: (n_mels, width), high freq at top.
+        img = mel_db.T[::-1, :]
+        lo = float(np.percentile(img, 5.0))
+        hi = float(np.percentile(img, 95.0))
+        if not (np.isfinite(lo) and np.isfinite(hi)) or hi <= lo + 1e-9:
+            lo = float(np.min(img))
+            hi = float(np.max(img))
+        if hi <= lo + 1e-9:
+            hi = lo + 1.0
+        norm = (img - lo) / (hi - lo)
+        norm = np.clip(norm, 0.0, 1.0)
+        u8 = np.round(norm * 255.0).astype(np.uint8)
+        rgb = np.repeat(u8[:, :, None], 3, axis=2)
+        png = _png_encode_rgb8(rgb)
+        b64 = base64.b64encode(png).decode("ascii")
+        return f"data:image/png;base64,{b64}"
+    except Exception:
+        return None
+
+
 def _compute_group_evals(
     groups: list[MethodGroup],
     evals_by_rel_bin: dict[str, EvalResult],
@@ -745,6 +864,7 @@ def _render(
     groups: list[MethodGroup],
     group_evals: list[GroupEval],
     evals_by_rel_bin: dict[str, EvalResult],
+    mel_by_rel_wav: dict[str, str],
     unmatched_wavs: list[WavItem],
     title: str,
     subtitle: str,
@@ -868,7 +988,13 @@ def _render(
             if it.rel_wav is not None:
                 wav_url = quote(it.rel_wav)
                 wav_cell = f"<code>{html.escape(it.rel_wav)}</code>"
-                audio_cell = f"<audio controls preload=\"none\" src=\"{wav_url}\"></audio>"
+                mel_uri = mel_by_rel_wav.get(it.rel_wav)
+                mel_img = (
+                    f"<img class=\"melspec\" src=\"{html.escape(mel_uri)}\" alt=\"mel\" />"
+                    if mel_uri
+                    else ""
+                )
+                audio_cell = f"<audio controls preload=\"none\" src=\"{wav_url}\"></audio>{mel_img}"
                 wav_dl = f" | <a href=\"{wav_url}\" download>wav</a>"
 
             min_bytes = (int(it.total_min_bits) + 7) // 8
@@ -948,7 +1074,7 @@ def _render(
 	            <th>最小 bit 数（含必要信息）</th>
 	            <th>质量（SNR/segSNR/melSNR）</th>
 	            <th>recon wav</th>
-	            <th>播放</th>
+	            <th>播放 / mel谱</th>
 	            <th></th>
 	          </tr>
         </thead>
@@ -974,6 +1100,11 @@ def _render(
                 meta.append(_fmt_dur(it.duration_s))
             meta_str = " / ".join(meta) if meta else "-"
             data_name = it.rel_path.lower()
+            mel_uri = mel_by_rel_wav.get(it.rel_path)
+            mel_img = (
+                f"<img class=\"melspec\" src=\"{html.escape(mel_uri)}\" alt=\"mel\" />" if mel_uri else ""
+            )
+            audio_html = f"<audio controls preload=\"none\" src=\"{rel_url}\"></audio>{mel_img}"
             rows.append(
                 "\n".join(
                     [
@@ -981,7 +1112,7 @@ def _render(
                         f"  <td class=\"name\"><code>{html.escape(it.rel_path)}</code></td>",
                         f"  <td class=\"meta\">{html.escape(meta_str)}</td>",
                         f"  <td class=\"size\">{html.escape(_fmt_size(it.size_bytes))}</td>",
-                        f"  <td class=\"player\"><audio controls preload=\"none\" src=\"{rel_url}\"></audio></td>",
+                        f"  <td class=\"player\">{audio_html}</td>",
                         f"  <td class=\"dl\"><a href=\"{rel_url}\" download>download</a></td>",
                         "</tr>",
                     ]
@@ -998,7 +1129,7 @@ def _render(
             <th>文件</th>
             <th>信息</th>
             <th>大小</th>
-            <th>播放</th>
+            <th>播放 / mel谱</th>
             <th></th>
           </tr>
         </thead>
@@ -1152,6 +1283,14 @@ def _render(
       }}
       audio {{
         width: min(560px, 100%);
+      }}
+      img.melspec {{
+        margin-top: 6px;
+        width: min(560px, 100%);
+        height: auto;
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        background: rgba(0,0,0,0.25);
       }}
       td.player {{
         min-width: 320px;
@@ -1360,6 +1499,16 @@ def main(argv: list[str] | None = None) -> int:
     unmatched = [w for rel, w in wavs_by_rel.items() if rel not in used_wavs]
     unmatched.sort(key=lambda it: it.rel_path.lower())
 
+    mel_by_rel_wav: dict[str, str] = {}
+    wav_rels = set(used_wavs) | {w.rel_path for w in unmatched}
+    for rel in sorted(wav_rels):
+        pth = (out_dir / rel).resolve()
+        if not pth.exists():
+            continue
+        uri = _mel_png_data_uri(pth)
+        if uri is not None:
+            mel_by_rel_wav[rel] = uri
+
     ts = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
     if args.best_by == "quality":
         score_desc = "score=segSNR_p50"
@@ -1381,6 +1530,7 @@ def main(argv: list[str] | None = None) -> int:
             groups,
             group_evals=group_evals,
             evals_by_rel_bin=evals_by_rel_bin,
+            mel_by_rel_wav=mel_by_rel_wav,
             unmatched_wavs=unmatched,
             title=args.title,
             subtitle=subtitle,
