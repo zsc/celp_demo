@@ -4,7 +4,7 @@ import argparse
 import time
 from pathlib import Path
 
-from . import bitstream, codec, wav_io
+from . import bitstream, codec, timbre, wav_io
 
 
 def _add_common_args(p: argparse.ArgumentParser) -> None:
@@ -165,6 +165,33 @@ def cmd_metrics(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_timbre(args: argparse.Namespace) -> int:
+    data = Path(args.input).read_bytes()
+
+    params = timbre.TimbreParams(
+        seed=int(args.seed),
+        f0_scale=float(args.f0_scale),
+        gp_scale=float(args.gp_scale),
+        gc_scale=float(args.gc_scale),
+        formant_scale=float(args.formant_scale),
+        lsf_spread=float(args.lsf_spread),
+        lsf_mix=float(args.lsf_mix),
+        target=str(args.target) if args.target else None,
+        min_sep_hz=float(args.min_sep_hz),
+        edge_sep_hz=float(args.edge_sep_hz),
+    )
+    out_bytes, _ = timbre.transform_bitstream(data, params, dump_json_path=args.dump_json)
+    Path(args.out_bitstream).write_bytes(out_bytes)
+
+    if args.out_wav is not None:
+        y, header, st = codec.decode_bitstream(out_bytes, clip=bool(args.clip))
+        wav_io.write_wav(args.out_wav, y, int(getattr(header, "fs")), clip=bool(args.clip))
+        print(f"timbre: wrote {args.out_bitstream} -> {args.out_wav} frames={st['frames']} fs={getattr(header,'fs')}")
+    else:
+        print(f"timbre: wrote {args.out_bitstream} ({len(out_bytes)} bytes)")
+    return 0
+
+
 def _out9_preset_config() -> codec.CodecConfig:
     return codec.CodecConfig(
         mode="acelp",
@@ -253,6 +280,24 @@ def build_parser() -> argparse.ArgumentParser:
     pm.add_argument("--y", required=True)
     pm.set_defaults(func=cmd_metrics)
 
+    pt = sub.add_parser("timbre", help="timbre transform in parameter domain (celpbin -> celpbin)")
+    pt.add_argument("--in", dest="input", required=True)
+    pt.add_argument("--out-bitstream", dest="out_bitstream", required=True)
+    pt.add_argument("--out-wav", dest="out_wav", default=None)
+    pt.add_argument("--dump-json", dest="dump_json", default=None)
+    pt.add_argument("--seed", type=int, default=1234)
+    pt.add_argument("--f0-scale", type=float, default=1.0)
+    pt.add_argument("--gp-scale", type=float, default=1.0)
+    pt.add_argument("--gc-scale", type=float, default=1.0)
+    pt.add_argument("--formant-scale", type=float, default=1.0)
+    pt.add_argument("--lsf-spread", type=float, default=1.0)
+    pt.add_argument("--lsf-mix", type=float, default=0.0)
+    pt.add_argument("--target", type=str, default=None)
+    pt.add_argument("--min-sep-hz", type=float, default=50.0)
+    pt.add_argument("--edge-sep-hz", type=float, default=50.0)
+    pt.add_argument("--clip", action=argparse.BooleanOptionalAction, default=True)
+    pt.set_defaults(func=cmd_timbre)
+
     po = sub.add_parser("out9", help="v1 ACELP preset (out9.celpbin style)")
     po.add_argument("--in", dest="input", required=True)
     po.add_argument("--out-bitstream", dest="out_bitstream", default="out9.celpbin")
@@ -270,3 +315,7 @@ def main(argv: list[str] | None = None) -> int:
     p = build_parser()
     args = p.parse_args(argv)
     return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -179,3 +179,89 @@ python3 -m unittest discover -v
 - `decode` 现在同时支持 `v1` 和 `v2`。
 - `roundtrip/encode` 默认输出 `v2`；可通过 `--bitstream-version 1` 切换到 v1。
 - `out9` 子命令固定输出 `v1 ACELP`（用于稳定复现 out9 配置）。
+
+## 10. `timbre_demo` 实验（参数域音色变换）
+
+`timbre_demo` 的目标是：在 **仅修改 bitstream 参数**（不触碰原始 wav）的前提下做音色相关增广，并产出可直接试听与对照的 HTML。
+
+### 10.1 实验入口
+
+```bash
+python3 tools/make_timbre_demo.py \
+  --pattern "../S*X/examples/*.wav" \
+  --out-dir timbre_demo \
+  --fs 16000 \
+  --lsf-mix 0.9 \
+  --grid-f0-alpha 0.9 \
+  --grid-gain-alpha 0.8 \
+  --mel-width 220
+```
+
+默认会优先选取 3 条样本（若存在）：
+- `en_happy_prompt.wav`
+- `fear_zh_female_prompt.wav`
+- `whisper_prompt.wav`
+
+### 10.2 实验流程
+
+1. 先把 3 条输入编码为 `v2 ACELP`（16k）得到 `s0/s1/s2.celpbin`。
+2. 从每条 bitstream 抽取风格统计（`lag` 中位数、`gp/gc` 均值）和目标 `LSF` 均值。
+3. 生成 `3x3` mimic：
+   - 对角线：identity（不变换）
+   - 非对角：联合迁移 `f0 + gp/gc + LSF`
+4. 生成增广：
+   - 常规增广（包含 formant 与非 formant）
+   - `Extreme Non-Formant`（仅 `f0/gp/gc`）
+5. 所有输出 wav 自动生成 mel 图，写入 `timbre_demo/mel/*.png`，并合成 `timbre_demo/timbre_demo.html`。
+
+### 10.3 HTML 页面结构
+
+`timbre_demo/timbre_demo.html` 包含四节：
+- `Reference`：`orig` 与 `recon` 对照
+- `3x3 Timbre Mimic Grid`：每格显示 `src/tgt/out` 三张 mel
+- `Augmentations`：常规增广（含 formant）
+- `Extreme Non-Formant`：极端非 formant 预设（仅 `f0/gp/gc`）
+
+### 10.4 关键预设说明
+
+`Augmentations`（常规）示例：
+- 非 formant：`f0_up/down`、`f0_ext_up/down`、`breathy`、`periodic`、`noisy`
+- formant：`formant_up/down`、`formant_expand/compress`、`chipmunk`
+
+`Extreme Non-Formant`（单独一节，明确不动 formant）：
+- `f0_ultra_up` / `f0_ultra_down`
+- `periodic_hard`（`gp↑↑, gc↓↓`）
+- `noisy_hard`（`gp↓↓, gc↑↑`）
+- `high_buzzy`（`f0↑ + gp↑ + gc↑`）
+- `low_hollow`（`f0↓ + gp↓ + gc↑`）
+
+### 10.5 强度调参建议
+
+- `3x3` 更像目标音色：提高 `--lsf-mix`、`--grid-f0-alpha`、`--grid-gain-alpha`
+- 更极端高音/花栗鼠倾向：提高 `f0_scale`，并配合 `formant_scale>1` / `lsf_spread>1`
+- 只做非 formant 质感变化：只调 `f0_scale/gp_scale/gc_scale`，保持 `formant_scale=1, lsf_spread=1, lsf_mix=0`
+
+## 11. 单文件 timbre 变换 CLI（`celpbin -> celpbin`）
+
+可直接对某个 bitstream 做参数域变换：
+
+```bash
+python3 -m celp_codec timbre \
+  --in out9.celpbin \
+  --out-bitstream out9_timbre.celpbin \
+  --out-wav out9_timbre.wav \
+  --f0-scale 1.25 \
+  --gp-scale 0.75 \
+  --gc-scale 1.35 \
+  --formant-scale 1.05 \
+  --lsf-spread 1.15 \
+  --dump-json out9_timbre.json
+```
+
+参数作用（子帧级）：
+- `--f0-scale`：通过缩放 `lag` 改变基频感知
+- `--gp-scale`：缩放自适应码本增益（周期成分）
+- `--gc-scale`：缩放固定码本增益（噪声/细节成分）
+- `--formant-scale`：整体 formant 上/下移
+- `--lsf-spread`：formant 间距扩张/压缩
+- `--lsf-mix` + `--target`：向目标音色 LSF 统计靠近

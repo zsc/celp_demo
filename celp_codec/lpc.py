@@ -72,6 +72,40 @@ def step_up(k: np.ndarray) -> np.ndarray:
     return a
 
 
+def step_down(a: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    """
+    Step-down recursion: LPC a (a[0]=1) -> reflection coefficients k.
+
+    This assumes a stable LPC filter; output is clipped to (-1,1) for safety.
+    """
+    a = np.asarray(a, dtype=np.float64).ravel()
+    if a.size < 2:
+        return np.zeros((0,), dtype=np.float64)
+    if not np.isfinite(a[0]) or a[0] == 0.0:
+        raise ValueError("Invalid a[0]")
+    if a[0] != 1.0:
+        a = a / float(a[0])
+
+    p = int(a.size - 1)
+    k = np.zeros((p,), dtype=np.float64)
+    a_work = a.copy()
+
+    for i in range(p, 0, -1):
+        ki = float(a_work[i])
+        ki = float(np.clip(ki, -0.9999, 0.9999))
+        k[i - 1] = ki
+        den = 1.0 - ki * ki
+        if den <= eps:
+            # Degenerate; remaining coeffs are unreliable.
+            break
+        a_next = a_work.copy()
+        for j in range(1, i):
+            a_next[j] = (a_work[j] - ki * a_work[i - j]) / den
+        a_work = a_next
+
+    return np.clip(k, -0.9999, 0.9999)
+
+
 def quantize_reflection_coeffs(k: np.ndarray, bits: int, vmax: float = 2.5) -> np.ndarray:
     k = np.asarray(k, dtype=np.float64).ravel()
     bits = int(bits)
@@ -99,4 +133,3 @@ def dequantize_reflection_coeffs(idx: np.ndarray, bits: int, vmax: float = 2.5) 
     k = np.tanh(v)
     k = np.clip(k, -0.9999, 0.9999)
     return k.astype(np.float64)
-
