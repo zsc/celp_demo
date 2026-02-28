@@ -97,6 +97,25 @@ python3 -m celp_codec encode \
 python3 -m celp_codec decode --in out9.celpbin --out decoded.wav
 ```
 
+### 4.4 out9 风格 + `fs=16000` 的推荐配置
+
+当前 `out9` 子命令固定为 `fs=8000`。如果要保留 out9 的 v1 风格并切到 16k，请用 `roundtrip/encode`，并把子帧改为 `4ms`：
+
+```bash
+python3 -m celp_codec roundtrip \
+  --in en_happy_prompt.wav \
+  --mode acelp --bitstream-version 1 \
+  --fs 16000 --frame-ms 20 --subframe-ms 4 \
+  --lpc-order 10 --rc-bits 7 --gain-bits-p 5 --gain-bits-c 5 \
+  --seed 1234 --dp-pitch on --dp-topk 10 --dp-lambda 0.2 \
+  --out-bitstream out9_16k.celpbin --out-wav out9_16k_recon.wav
+```
+
+说明：
+- 这会得到 v1 header：`fs=16000, frame_len=320, subframe_len=64, p=10, rc_bits=7, gain_bits_p=5, gain_bits_c=5, seed=1234`。
+- 不建议 `subframe-ms=5`（80 点），因为 v1 ACELP 每轨位置索引固定是 `4 bits`，16k/5ms 下单轨候选数会超过 16，当前实现会报错。
+- 如果必须使用 `5ms@16k`，需要扩展 v1 格式（例如把 `pos_idx` 从 4bit 提到 5bit），这将不再是当前 out9 兼容定义。
+
 ## 5. “是否有信息泄漏”快速自测
 
 目标：确认 `celpbin -> wav` 只依赖 `celpbin` 本身。
