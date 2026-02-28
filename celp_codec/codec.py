@@ -10,7 +10,9 @@ from . import acelp, celp_codebook, filters, gains, lpc, metrics, pitch
 from .bitstream import (
     BitReader,
     BitWriter,
+    BitstreamHeaderV1,
     BitstreamHeaderV2,
+    VERSION_V1,
     VERSION_V2,
     read_header,
 )
@@ -21,6 +23,17 @@ MODE_ACELP = 1
 
 FLAG_POSTFILTER = 1 << 0
 FLAG_LPC_INTERP = 1 << 1
+
+V1_PITCH_MIN_HZ = 50.0
+V1_PITCH_MAX_HZ = 400.0
+V1_LAG_BITS = 8
+V1_GAMMA1 = 0.9
+V1_GAMMA2 = 0.6
+V1_GP_MAX = 1.2
+V1_GC_MAX = 2.0
+V1_TRACKS = 4
+V1_CELP_CODEBOOK_SIZE = 512
+V1_CELP_CB_BITS = 9
 
 
 @dataclass
@@ -225,6 +238,72 @@ def _innov_acelp_shape(
     w_hat = acelp.dequantize_unit(w_idx, weight_bits)
     c_shape_hat = acelp.support_to_vector(pos, w_hat, length=L)
     return pos, w_idx, c_shape_hat
+
+
+def _acelp_track_positions(subframe_len: int, tracks: int) -> list[np.ndarray]:
+    L = int(subframe_len)
+    T = int(tracks)
+    if L <= 0 or T <= 0:
+        raise ValueError("Invalid ACELP track layout.")
+    return [np.arange(t, L, T, dtype=np.int64) for t in range(T)]
+
+
+def _innov_acelp_v1_shape(
+    residual: np.ndarray,
+    H: np.ndarray,
+    track_positions: list[np.ndarray],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    v1 ACELP innovation:
+      - exactly one pulse per track
+      - pulse amplitude is fixed to +/-1
+      - bitstream stores per-track (pos_idx, sign)
+    """
+    r = np.asarray(residual, dtype=np.float64).ravel().copy()
+    H = np.asarray(H, dtype=np.float64)
+    L = int(r.size)
+    T = len(track_positions)
+
+    pos_idx = np.zeros((T,), dtype=np.int64)
+    signs = np.ones((T,), dtype=np.int64)
+    c = np.zeros((L,), dtype=np.float64)
+
+    for t, cand in enumerate(track_positions):
+        if cand.size == 0:
+            continue
+        atoms = H[:, cand]
+        corr = atoms.T @ r
+        j = int(np.argmax(np.abs(corr)))
+        sgn = 1 if float(corr[j]) >= 0.0 else -1
+        pos = int(cand[j])
+        pos_idx[t] = int(j)
+        signs[t] = int(sgn)
+        c[pos] += float(sgn)
+        r = r - float(sgn) * atoms[:, j]
+
+    return pos_idx, signs, c
+
+
+def _innov_celp_v1_shape(
+    residual: np.ndarray,
+    H: np.ndarray,
+    codebook: np.ndarray,
+    eps: float = 1e-12,
+) -> tuple[int, np.ndarray]:
+    """
+    v1 CELP innovation:
+      - fixed Gaussian codebook size 512
+      - one index per subframe
+    """
+    r = np.asarray(residual, dtype=np.float64).ravel()
+    H = np.asarray(H, dtype=np.float64)
+    C = np.asarray(codebook, dtype=np.float64)
+    Y = C @ H.T
+    dots = Y @ r
+    energies = np.sum(Y * Y, axis=1) + eps
+    scores = np.where(dots > 0.0, (dots * dots) / energies, 0.0)
+    idx = int(np.argmax(scores))
+    return idx, C[idx]
 
 
 def encode_samples(
@@ -512,12 +591,255 @@ def encode_samples(
     return bitstream_bytes, recon, debug, stats
 
 
-def decode_bitstream(data: bytes, clip: bool | None = None) -> tuple[np.ndarray, BitstreamHeaderV2, dict]:
+def encode_samples_v1(
+    x_in: np.ndarray,
+    cfg: CodecConfig,
+    dump_json_path: str | None = None,
+) -> tuple[bytes, np.ndarray, dict | None, dict]:
+    """
+    Encode float64 mono samples in [-1,1] to bitstream v1.
+
+    v1 conventions are fixed for decoder interoperability:
+      - lag index: 8 bits, lag range from fs and [50, 400] Hz (clamped to 8-bit span)
+      - ACELP innovation: 4 tracks, 1 pulse/track, pulse amplitude +/-1
+      - CELP innovation: fixed codebook size 512 (single index/subframe)
+      - gain de/quant range: gp in [0,1.2], gc in [0,2.0]
+      - weighting filter gammas: gamma1=0.9, gamma2=0.6
+      - no LPC interpolation in decoder path
+    """
+    t0 = time.time()
+
+    mode_id = _mode_id(cfg.mode)
+    fs = int(cfg.fs)
+    frame_len = cfg.frame_len()
+    subframe_len = cfg.subframe_len()
+    subframes = cfg.subframes_per_frame()
+    lpc_order = cfg.resolved_lpc_order()
+
+    if frame_len <= 0 or subframe_len <= 0:
+        raise ValueError("Invalid frame/subframe length.")
+
+    lag_min, lag_max = pitch.lag_bounds(
+        fs,
+        V1_PITCH_MIN_HZ,
+        V1_PITCH_MAX_HZ,
+        max_lag_bits=V1_LAG_BITS,
+    )
+    if lag_max - lag_min > ((1 << V1_LAG_BITS) - 1):
+        raise ValueError("v1 lag range exceeds 8-bit index span.")
+
+    header = BitstreamHeaderV1(
+        mode=mode_id,
+        fs=fs,
+        frame_len=int(frame_len),
+        subframe_len=int(subframe_len),
+        lpc_order=int(lpc_order),
+        rc_bits=int(cfg.rc_bits),
+        gain_bits_p=int(cfg.gain_bits_p),
+        gain_bits_c=int(cfg.gain_bits_c),
+        seed=int(cfg.seed),
+    )
+    bw = BitWriter()
+
+    debug: dict | None = None
+    if dump_json_path is not None:
+        debug = {"fs": fs, "mode": cfg.mode.lower(), "version": VERSION_V1, "frames": []}
+
+    x = np.asarray(x_in, dtype=np.float64).ravel()
+    x = np.clip(x, -1.0, 1.0)
+    pad = (-x.size) % frame_len
+    if pad:
+        x = np.concatenate([x, np.zeros((pad,), dtype=np.float64)])
+    n_frames = x.size // frame_len
+    total_samples = int(x.size)
+
+    mem_syn = np.zeros((lpc_order,), dtype=np.float64)
+    mem_w = np.zeros((lpc_order,), dtype=np.float64)
+    mem_F = np.zeros((2 * lpc_order,), dtype=np.float64)
+    exc_buf = np.zeros((lag_max + subframe_len + 2,), dtype=np.float64)
+    prev_rc_idx = np.zeros((lpc_order,), dtype=np.int64)
+
+    v1_track_positions = _acelp_track_positions(subframe_len, V1_TRACKS)
+    for cand in v1_track_positions:
+        if cand.size > 16:
+            raise ValueError("v1 ACELP requires <=16 positions per track (4-bit pos_idx).")
+
+    celp_v1_codebook = None
+    if mode_id == MODE_CELP:
+        celp_v1_codebook = celp_codebook.generate_codebook(int(cfg.seed), V1_CELP_CODEBOOK_SIZE, subframe_len)
+
+    recon = np.zeros((total_samples,), dtype=np.float64)
+
+    for fi in range(int(n_frames)):
+        frame = x[fi * frame_len : (fi + 1) * frame_len]
+
+        _, rc_idx = _analyze_lpc(frame, lpc_order, cfg.rc_bits, prev_rc_idx, preemph=cfg.lpc_preemph)
+        prev_rc_idx = rc_idx
+        for idx in rc_idx.tolist():
+            bw.write_bits(int(idx), cfg.rc_bits)
+
+        zeros_sf = np.zeros((subframe_len,), dtype=np.float64)
+        k_cur_hat = lpc.dequantize_reflection_coeffs(rc_idx, cfg.rc_bits)
+        a_frame = lpc.step_up(k_cur_hat)
+        a_frame[0] = 1.0
+
+        frame_dbg = None
+        if debug is not None:
+            frame_dbg = {"frame_index": fi, "rc_idx": rc_idx.tolist(), "subframes": []}
+            debug["frames"].append(frame_dbg)
+
+        if cfg.dp_pitch:
+            mem_w0 = mem_w.copy()
+            mem_F0 = mem_F.copy()
+            exc0 = exc_buf.copy()
+
+            cand_lags: list[np.ndarray] = []
+            cand_scores: list[np.ndarray] = []
+
+            mem_w_tmp = mem_w0.copy()
+            mem_F_tmp = mem_F0.copy()
+            exc_tmp = exc0.copy()
+
+            for si in range(subframes):
+                A_g1, A_g2, denom_F = _build_weighting_filters(a_frame, gamma1=V1_GAMMA1, gamma2=V1_GAMMA2)
+                h = filters.impulse_response(A_g1, denom_F, subframe_len)
+                H = filters.conv_matrix(h)
+
+                s = frame[si * subframe_len : (si + 1) * subframe_len]
+                s_w, mem_w_tmp = filters.iir_filter(A_g1, A_g2, s, zi=mem_w_tmp)
+                y_free, _ = filters.iir_filter(A_g1, denom_F, zeros_sf, zi=mem_F_tmp)
+                d = s_w - y_free
+
+                lags_k, scores_k = pitch.topk_pitch_candidates(
+                    d, H, exc_tmp, lag_min, lag_max, topk=cfg.dp_topk
+                )
+                cand_lags.append(lags_k)
+                cand_scores.append(scores_k)
+
+                lag_g = int(lags_k[0]) if lags_k.size else int(lag_min)
+                ep = exc_tmp[-lag_g - subframe_len : -lag_g].copy()
+                yp = H @ ep
+                gp = gains.estimate_gain(d, yp, max_gain=V1_GP_MAX)
+                e = gp * ep
+                _, mem_F_tmp = filters.iir_filter(A_g1, denom_F, e, zi=mem_F_tmp)
+                exc_tmp[:-subframe_len] = exc_tmp[subframe_len:]
+                exc_tmp[-subframe_len:] = e
+
+            lags_path = pitch.viterbi_smooth_lags(cand_lags, cand_scores, cfg.dp_lambda)
+        else:
+            lags_path = []
+
+        A_g1, A_g2, denom_F = _build_weighting_filters(a_frame, gamma1=V1_GAMMA1, gamma2=V1_GAMMA2)
+        h = filters.impulse_response(A_g1, denom_F, subframe_len)
+        H = filters.conv_matrix(h)
+
+        for si in range(subframes):
+            s = frame[si * subframe_len : (si + 1) * subframe_len]
+            s_w, mem_w = filters.iir_filter(A_g1, A_g2, s, zi=mem_w)
+            y_free, _ = filters.iir_filter(A_g1, denom_F, zeros_sf, zi=mem_F)
+            d = s_w - y_free
+
+            if cfg.dp_pitch:
+                lag = int(lags_path[si])
+            else:
+                lags_1, _ = pitch.topk_pitch_candidates(d, H, exc_buf, lag_min, lag_max, topk=1)
+                lag = int(lags_1[0]) if lags_1.size else int(lag_min)
+
+            ep = exc_buf[-lag - subframe_len : -lag].copy()
+            yp = H @ ep
+            gp_pre = gains.estimate_gain(d, yp, max_gain=V1_GP_MAX)
+            r0 = d - gp_pre * yp
+
+            if mode_id == MODE_CELP:
+                assert celp_v1_codebook is not None
+                cb_idx, c_shape_hat = _innov_celp_v1_shape(r0, H, celp_v1_codebook)
+                y_c = H @ c_shape_hat
+            else:
+                pos_idx, signs, c_shape_hat = _innov_acelp_v1_shape(r0, H, v1_track_positions)
+                y_c = H @ c_shape_hat
+
+            gp, gc = gains.estimate_gains_joint(d, yp, y_c, gp_max=V1_GP_MAX, gc_max=V1_GC_MAX)
+            gp_idx = gains.quantize_gain(gp, cfg.gain_bits_p, xmin=1e-4, xmax=V1_GP_MAX)
+            gc_idx = gains.quantize_gain(gc, cfg.gain_bits_c, xmin=1e-4, xmax=V1_GC_MAX)
+            gp_hat = gains.dequantize_gain(gp_idx, cfg.gain_bits_p, xmin=1e-4, xmax=V1_GP_MAX)
+            gc_hat = gains.dequantize_gain(gc_idx, cfg.gain_bits_c, xmin=1e-4, xmax=V1_GC_MAX)
+
+            lag_idx = int(lag - lag_min)
+            bw.write_bits(lag_idx, V1_LAG_BITS)
+            bw.write_bits(int(gp_idx), cfg.gain_bits_p)
+            bw.write_bits(int(gc_idx), cfg.gain_bits_c)
+
+            if mode_id == MODE_CELP:
+                bw.write_bits(int(cb_idx), V1_CELP_CB_BITS)
+                c_dbg = {"cb_idx": int(cb_idx)}
+            else:
+                track_dbg: list[dict[str, int]] = []
+                for t, cand in enumerate(v1_track_positions):
+                    idx_t = int(pos_idx[t])
+                    idx_t = min(max(idx_t, 0), cand.size - 1)
+                    sign_t = int(signs[t])
+                    bw.write_bits(idx_t, 4)
+                    bw.write_bits(0 if sign_t > 0 else 1, 1)
+                    track_dbg.append({"track": t, "pos": int(cand[idx_t]), "sign": int(sign_t)})
+                c_dbg = {"tracks": track_dbg}
+
+            c = gc_hat * c_shape_hat
+            e = gp_hat * ep + c
+            _, mem_F = filters.iir_filter(A_g1, denom_F, e, zi=mem_F)
+            s_hat, mem_syn = filters.iir_filter(np.array([1.0]), a_frame, e, zi=mem_syn)
+
+            recon[
+                fi * frame_len + si * subframe_len : fi * frame_len + (si + 1) * subframe_len
+            ] = s_hat
+
+            exc_buf[:-subframe_len] = exc_buf[subframe_len:]
+            exc_buf[-subframe_len:] = e
+
+            if frame_dbg is not None:
+                sf = {"lag": int(lag), "gp_idx": int(gp_idx), "gc_idx": int(gc_idx)}
+                if mode_id == MODE_CELP:
+                    sf["celp"] = c_dbg
+                else:
+                    sf["acelp"] = c_dbg
+                frame_dbg["subframes"].append(sf)
+
+    bitstream_bytes = header.to_bytes() + bw.get_bytes()
+
+    if cfg.clip:
+        recon = np.clip(recon, -1.0, 1.0).astype(np.float64, copy=False)
+
+    if dump_json_path is not None and debug is not None:
+        with open(dump_json_path, "w", encoding="utf-8") as f:
+            json.dump(debug, f, ensure_ascii=False, indent=2)
+
+    t1 = time.time()
+    stats = {
+        "version": VERSION_V1,
+        "frames": int(n_frames),
+        "samples": int(total_samples),
+        "seconds": float(total_samples / float(fs)),
+        "payload_bits": int(bw.bits_written),
+        "total_bits": int(len(header.to_bytes()) * 8 + bw.bits_written),
+        "encode_seconds": float(t1 - t0),
+    }
+    return bitstream_bytes, recon, debug, stats
+
+
+def decode_bitstream(
+    data: bytes, clip: bool | None = None
+) -> tuple[np.ndarray, BitstreamHeaderV1 | BitstreamHeaderV2, dict]:
     header_any, header_size = read_header(data)
-    if not isinstance(header_any, BitstreamHeaderV2):
-        raise ValueError("This build expects v2 bitstreams; please re-encode.")
-    header = header_any
-    br = BitReader(data[header_size:])
+    if isinstance(header_any, BitstreamHeaderV2):
+        return _decode_v2(data[header_size:], header_any, clip=clip)
+    return _decode_v1(data[header_size:], header_any, clip=clip)
+
+
+def _decode_v2(
+    payload: bytes,
+    header: BitstreamHeaderV2,
+    clip: bool | None = None,
+) -> tuple[np.ndarray, BitstreamHeaderV2, dict]:
+    br = BitReader(payload)
 
     if header.fs <= 0 or header.frame_len <= 0 or header.subframe_len <= 0:
         raise ValueError("Invalid header parameters.")
@@ -571,7 +893,8 @@ def decode_bitstream(data: bytes, clip: bool | None = None) -> tuple[np.ndarray,
             a_hat[0] = 1.0
             try:
                 lag_i = br.read_bits(lag_bits)
-                frac = br.read_bits(header.pitch_frac_bits) if header.pitch_frac_bits else 0
+                if header.pitch_frac_bits:
+                    _ = br.read_bits(header.pitch_frac_bits)
                 gp_idx = br.read_bits(header.gain_bits_p)
                 gc_idx = br.read_bits(header.gain_bits_c)
             except EOFError:
@@ -625,12 +948,115 @@ def decode_bitstream(data: bytes, clip: bool | None = None) -> tuple[np.ndarray,
 
 
 def _finalize_decode(
-    out_chunks: list[np.ndarray], header: BitstreamHeaderV2, frames_decoded: int, clip: bool
-) -> tuple[np.ndarray, BitstreamHeaderV2, dict]:
+    out_chunks: list[np.ndarray],
+    header: BitstreamHeaderV1 | BitstreamHeaderV2,
+    frames_decoded: int,
+    clip: bool,
+) -> tuple[np.ndarray, BitstreamHeaderV1 | BitstreamHeaderV2, dict]:
     y = np.concatenate(out_chunks) if out_chunks else np.zeros((0,), dtype=np.float64)
     if clip:
         y = np.clip(y, -1.0, 1.0)
     return y, header, {"frames": int(frames_decoded)}
+
+
+def _decode_v1(
+    payload: bytes,
+    header: BitstreamHeaderV1,
+    clip: bool | None = None,
+) -> tuple[np.ndarray, BitstreamHeaderV1, dict]:
+    br = BitReader(payload)
+
+    if header.fs <= 0 or header.frame_len <= 0 or header.subframe_len <= 0:
+        raise ValueError("Invalid header parameters.")
+
+    mode_id = int(header.mode)
+    frame_len = int(header.frame_len)
+    subframe_len = int(header.subframe_len)
+    if frame_len % subframe_len != 0:
+        raise ValueError("frame_len must be divisible by subframe_len.")
+    subframes = frame_len // subframe_len
+    lag_min, lag_max = pitch.lag_bounds(
+        int(header.fs),
+        V1_PITCH_MIN_HZ,
+        V1_PITCH_MAX_HZ,
+        max_lag_bits=V1_LAG_BITS,
+    )
+
+    if clip is None:
+        clip = True
+
+    mem_syn = np.zeros((header.lpc_order,), dtype=np.float64)
+    exc_buf = np.zeros((lag_max + subframe_len + 2,), dtype=np.float64)
+
+    codebook = None
+    if mode_id == MODE_CELP:
+        codebook = celp_codebook.generate_codebook(int(header.seed), V1_CELP_CODEBOOK_SIZE, subframe_len)
+    track_positions = _acelp_track_positions(subframe_len, V1_TRACKS)
+    for cand in track_positions:
+        if cand.size > 16:
+            raise ValueError("Unsupported v1 ACELP layout: positions/track exceeds 4-bit index.")
+
+    out: list[np.ndarray] = []
+    frames_decoded = 0
+
+    while True:
+        try:
+            rc_idx = [br.read_bits(header.rc_bits) for _ in range(header.lpc_order)]
+        except EOFError:
+            break
+
+        k_hat = lpc.dequantize_reflection_coeffs(np.array(rc_idx, dtype=np.int64), header.rc_bits)
+        a_hat = lpc.step_up(k_hat)
+        a_hat[0] = 1.0
+
+        for _ in range(subframes):
+            try:
+                lag_i = br.read_bits(V1_LAG_BITS)
+                gp_idx = br.read_bits(header.gain_bits_p)
+                gc_idx = br.read_bits(header.gain_bits_c)
+            except EOFError:
+                return _finalize_decode(out, header, frames_decoded, clip)
+
+            lag = lag_min + int(lag_i)
+            if lag < 1:
+                lag = 1
+            if lag > lag_max:
+                lag = lag_max
+            ep = exc_buf[-lag - subframe_len : -lag].copy()
+
+            gp_hat = gains.dequantize_gain(gp_idx, header.gain_bits_p, xmin=1e-4, xmax=V1_GP_MAX)
+            gc_hat = gains.dequantize_gain(gc_idx, header.gain_bits_c, xmin=1e-4, xmax=V1_GC_MAX)
+
+            if mode_id == MODE_CELP:
+                assert codebook is not None
+                try:
+                    cb_idx = int(br.read_bits(V1_CELP_CB_BITS))
+                except EOFError:
+                    return _finalize_decode(out, header, frames_decoded, clip)
+                c = codebook[cb_idx]
+            else:
+                c = np.zeros((subframe_len,), dtype=np.float64)
+                try:
+                    for t, cand in enumerate(track_positions):
+                        idx = int(br.read_bits(4))
+                        sign_bit = int(br.read_bits(1))
+                        idx = min(max(idx, 0), cand.size - 1)
+                        pos = int(cand[idx])
+                        sign = -1.0 if sign_bit else 1.0
+                        c[pos] += sign
+                except EOFError:
+                    return _finalize_decode(out, header, frames_decoded, clip)
+
+            e = gp_hat * ep + gc_hat * c
+            s_hat, mem_syn = filters.iir_filter(np.array([1.0]), a_hat, e, zi=mem_syn)
+            out.append(s_hat)
+
+            exc_buf[:-subframe_len] = exc_buf[subframe_len:]
+            exc_buf[-subframe_len:] = e
+
+        frames_decoded += 1
+
+    return _finalize_decode(out, header, frames_decoded, clip)
 
 
 def roundtrip_metrics(x: np.ndarray, y: np.ndarray, frame_len: int) -> dict:

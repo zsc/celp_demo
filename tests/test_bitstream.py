@@ -3,9 +3,10 @@ import unittest
 from celp_codec.bitstream import (
     BitReader,
     BitWriter,
+    BitstreamHeaderV1,
     BitstreamHeaderV2,
+    HEADER_V1_SIZE,
     HEADER_V2_SIZE,
-    VERSION_V2,
     read_header,
 )
 
@@ -61,6 +62,32 @@ class TestBitstream(unittest.TestCase):
         self.assertEqual(h2.flags, h.flags)
         self.assertEqual(h2.celp_codebook_size, h.celp_codebook_size)
         self.assertEqual(h2.celp_stages, h.celp_stages)
+
+    def test_header_v1_pack_unpack(self) -> None:
+        h = BitstreamHeaderV1(
+            mode=1,
+            fs=8000,
+            frame_len=160,
+            subframe_len=40,
+            lpc_order=10,
+            rc_bits=7,
+            gain_bits_p=5,
+            gain_bits_c=5,
+            seed=1234,
+        )
+        b = h.to_bytes()
+        self.assertEqual(len(b), HEADER_V1_SIZE)
+        h2, hs = read_header(b + b"payload")
+        self.assertEqual(hs, HEADER_V1_SIZE)
+        self.assertEqual(h2.mode, h.mode)
+        self.assertEqual(h2.fs, h.fs)
+        self.assertEqual(h2.frame_len, h.frame_len)
+        self.assertEqual(h2.subframe_len, h.subframe_len)
+        self.assertEqual(h2.lpc_order, h.lpc_order)
+        self.assertEqual(h2.rc_bits, h.rc_bits)
+        self.assertEqual(h2.gain_bits_p, h.gain_bits_p)
+        self.assertEqual(h2.gain_bits_c, h.gain_bits_c)
+        self.assertEqual(h2.seed, h.seed)
 
 
 if __name__ == "__main__":

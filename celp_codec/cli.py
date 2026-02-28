@@ -8,6 +8,7 @@ from . import bitstream, codec, wav_io
 
 
 def _add_common_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--bitstream-version", type=int, default=2, choices=[1, 2])
     p.add_argument("--fs", type=int, default=16000, choices=[8000, 16000])
     p.add_argument("--frame-ms", type=int, default=20)
     p.add_argument("--subframe-ms", type=int, default=5)
@@ -83,6 +84,20 @@ def _print_summary(cfg: codec.CodecConfig, stats: dict, m: dict, wall_s: float) 
     )
 
 
+def _encode_dispatch(
+    x: object,
+    cfg: codec.CodecConfig,
+    version: int,
+    dump_json_path: str | None,
+) -> tuple[bytes, object, dict | None, dict]:
+    ver = int(version)
+    if ver == 1:
+        return codec.encode_samples_v1(x, cfg, dump_json_path=dump_json_path)
+    if ver == 2:
+        return codec.encode_samples(x, cfg, dump_json_path=dump_json_path)
+    raise ValueError(f"Unsupported bitstream version: {ver}")
+
+
 def cmd_roundtrip(args: argparse.Namespace) -> int:
     cfg = _cfg_from_args(args)
 
@@ -90,7 +105,12 @@ def cmd_roundtrip(args: argparse.Namespace) -> int:
     x = wav_io.resample_to_fs(x, fs_in, cfg.fs)
 
     t0 = time.time()
-    bit_bytes, _, _, stats = codec.encode_samples(x, cfg, dump_json_path=args.dump_json)
+    bit_bytes, _, _, stats = _encode_dispatch(
+        x,
+        cfg,
+        version=int(args.bitstream_version),
+        dump_json_path=args.dump_json,
+    )
     Path(args.out_bitstream).write_bytes(bit_bytes)
 
     if args.print_hex is not None:
@@ -111,7 +131,12 @@ def cmd_encode(args: argparse.Namespace) -> int:
     cfg = _cfg_from_args(args)
     x, fs_in = wav_io.read_wav(args.input)
     x = wav_io.resample_to_fs(x, fs_in, cfg.fs)
-    bit_bytes, _, _, stats = codec.encode_samples(x, cfg, dump_json_path=args.dump_json)
+    bit_bytes, _, _, stats = _encode_dispatch(
+        x,
+        cfg,
+        version=int(args.bitstream_version),
+        dump_json_path=args.dump_json,
+    )
     Path(args.out).write_bytes(bit_bytes)
     if args.print_hex is not None:
         print("hex:", bitstream.bytes_hex_prefix(bit_bytes, args.print_hex))
@@ -137,6 +162,58 @@ def cmd_metrics(args: argparse.Namespace) -> int:
         y = wav_io.resample_to_fs(y, fsy, fsx)
     m = codec.roundtrip_metrics(x, y, frame_len=int(round(fsx * 0.02)))
     print(f"SNR={m['snr_db']:.2f} dB segSNR={m['seg_snr_db']:.2f} dB")
+    return 0
+
+
+def _out9_preset_config() -> codec.CodecConfig:
+    return codec.CodecConfig(
+        mode="acelp",
+        fs=8000,
+        frame_ms=20,
+        subframe_ms=5,
+        lpc_order=10,
+        lpc_preemph=0.97,
+        lpc_interp=False,
+        pitch_min_hz=50.0,
+        pitch_max_hz=400.0,
+        pitch_frac_bits=0,
+        dp_pitch=True,
+        dp_topk=10,
+        dp_lambda=0.2,
+        rc_bits=7,
+        gain_bits_p=5,
+        gain_bits_c=5,
+        gp_max=1.2,
+        gc_max=2.0,
+        seed=1234,
+        clip=True,
+        postfilter=False,
+    )
+
+
+def cmd_out9(args: argparse.Namespace) -> int:
+    cfg = _out9_preset_config()
+    cfg.clip = bool(args.clip)
+
+    x, fs_in = wav_io.read_wav(args.input)
+    x = wav_io.resample_to_fs(x, fs_in, cfg.fs)
+
+    t0 = time.time()
+    bit_bytes, _, _, stats = codec.encode_samples_v1(x, cfg, dump_json_path=args.dump_json)
+    Path(args.out_bitstream).write_bytes(bit_bytes)
+
+    if args.print_hex is not None:
+        print("hex:", bitstream.bytes_hex_prefix(bit_bytes, args.print_hex))
+    if args.print_base64 is not None:
+        print("base64:", bitstream.bytes_base64_prefix(bit_bytes, args.print_base64))
+
+    y, header, _ = codec.decode_bitstream(bit_bytes, clip=cfg.clip)
+    wav_io.write_wav(args.out_wav, y, int(header.fs), clip=cfg.clip)
+
+    m = codec.roundtrip_metrics(x, y, frame_len=cfg.frame_len())
+    t1 = time.time()
+    _print_summary(cfg, stats, m, wall_s=t1 - t0)
+    print("preset=out9 version=1 mode=acelp fs=8000 frame_len=160 subframe_len=40 p=10 rc=7 gp=5 gc=5 seed=1234")
     return 0
 
 
@@ -175,6 +252,16 @@ def build_parser() -> argparse.ArgumentParser:
     pm.add_argument("--x", required=True)
     pm.add_argument("--y", required=True)
     pm.set_defaults(func=cmd_metrics)
+
+    po = sub.add_parser("out9", help="v1 ACELP preset (out9.celpbin style)")
+    po.add_argument("--in", dest="input", required=True)
+    po.add_argument("--out-bitstream", dest="out_bitstream", default="out9.celpbin")
+    po.add_argument("--out-wav", dest="out_wav", default="out9_recon.wav")
+    po.add_argument("--dump-json", dest="dump_json", default=None)
+    po.add_argument("--print-hex", dest="print_hex", type=int, default=None)
+    po.add_argument("--print-base64", dest="print_base64", type=int, default=None)
+    po.add_argument("--clip", action=argparse.BooleanOptionalAction, default=True)
+    po.set_defaults(func=cmd_out9)
 
     return p
 
