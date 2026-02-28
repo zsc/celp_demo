@@ -152,6 +152,30 @@ celpcodec augment --in in.celpbin --out-dir aug/ --n 8 \
 
 必须保证确定性：所有随机选择只依赖 `--seed` + `(frame_idx, subframe_idx, track_idx, pulse_idx)`。
 
+### 5.4 F0 估计质量与 ACF 增强（可选）
+
+现状说明（回答“现在的 F0 估计好不好”）：
+
+- 当前 codec 在编码端的 pitch/lag 选择属于 **AbS（analysis-by-synthesis）闭环 LTP 搜索 + DP 平滑**：它更像“用于合成最优的长时预测参数”，而不是专门的高精度 F0 tracker。
+- 在 **voiced（有明显基音）** 段通常足够稳定；在 **unvoiced/whisper/噪声/弱能量** 段，lag 往往不可靠（但很多时候 `g_p` 也会很小，听感影响有限）。
+- `timbre` 命令的最小实现是“只对 bitstream 里的 lag 做变换”，因此 F0 质量最终取决于原始编码的 lag 质量；如果要避免在不可靠段产生伪影，应引入 **voicing/置信度 gate**。
+
+如果觉得不够好，建议把 ACF（autocorrelation）作为“增强而非替代”：
+
+1. **voicing gate（推荐，低风险）**：
+   - 仅在 `g_p` 足够大（例如 `g_p > gp_gate`）且 ACF 置信度高时应用 `--f0-scale`，否则保持原 lag 不变。
+   - ACF 可在 `timbre` 内部对“由输入 bitstream 解码得到的语音”计算（仍然只依赖 `celpbin`，不引入额外信息源）。
+2. **候选约束 / 纠错（可选）**：
+   - 用 ACF 提供一组候选 lag（top-N peaks + 邻域），再做轻量搜索/平滑，或在 ACF 置信度很高且与原 lag 差异很大时做纠错（需谨慎，容易破坏编码器-解码器假设）。
+3. **为 `--target target.wav` 提供 F0 统计（可选）**：
+   - 如果支持用目标 WAV 推导 `f0_scale`（例如 median 对齐），推荐直接对目标 WAV 做 ACF 得到 `F0` 分布与 voicing mask，而不是依赖目标先编码再反推。
+
+ACF 的最小算法建议（整数 lag）：
+
+- 取分析信号 `x`（建议用 LPC residual 或预加重后的语音），对每子帧加窗。
+- 在 `lag ∈ [lag_min, lag_max]` 上计算自相关 `r[lag]`，并归一化 `rho[lag] = r[lag] / (r[0] + eps)`。
+- `lag_acf = argmax rho[lag]`，置信度 `conf = rho[lag_acf]`；用阈值（例如 `conf >= 0.3`）判断 voiced。
+
 ## 6. LSF/LSP 变换（用于 timbre / formant）
 
 ### 6.1 为什么要 LSF/LSP
